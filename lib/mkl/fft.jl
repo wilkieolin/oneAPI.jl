@@ -33,7 +33,11 @@ const MKLFFT_INVERSE = false
 
 mutable struct cMKLFFTPlan{T,K,inplace,N,R,B} <: MKLFFTPlan{T,K,inplace}
     handle::onemklDftDescriptor_t
-    queue::syclQueue_t
+    # Hold the SYCL queue wrapper (not the raw handle) so its finalizer
+    # doesn't fire while the descriptor still references the underlying
+    # sycl::queue. unsafe_convert(::Type{syclQueue_t}, ::syclQueue)
+    # gives the raw handle to C calls when needed.
+    queue::SYCL.syclQueue
     sz::NTuple{N,Int}
     osz::NTuple{N,Int}
     realdomain::Bool
@@ -47,7 +51,7 @@ end
 # Real transforms use separate struct (mirroring AMDGPU style) for buffer staging
 mutable struct rMKLFFTPlan{T,K,inplace,N,R,B} <: MKLFFTPlan{T,K,inplace}
     handle::onemklDftDescriptor_t
-    queue::syclQueue_t
+    queue::SYCL.syclQueue
     sz::NTuple{N,Int}
     osz::NTuple{N,Int}
     xtype::Symbol
@@ -57,6 +61,21 @@ mutable struct rMKLFFTPlan{T,K,inplace,N,R,B} <: MKLFFTPlan{T,K,inplace}
     outer_count::Int        # execute-time loop trip count
     in_outer_stride::Int    # element stride per outer slice (input layout)
     out_outer_stride::Int   # element stride per outer slice (output layout)
+end
+
+# Attach a finalizer that frees the oneMKL DFT descriptor when the plan is GC'd.
+# IMPORTANT: only call this on the ORIGINAL plan that owns the descriptor; inverse
+# plans created by plan_inv share the same handle and must NOT register their own
+# finalizer (double-free).
+function _attach_descriptor_finalizer!(plan::MKLFFTPlan)
+    finalizer(plan) do p
+        try
+            onemklDftDestroy(p.handle)
+        catch
+            # Process-teardown races during finalization are not actionable here.
+        end
+    end
+    plan
 end
 
 # Inverse plan constructors (derive from existing plan)
@@ -209,8 +228,7 @@ end
 # already throws "commit failed (-1)". As a result, only single-axis
 # partial-region transforms are reliably batched here; multi-axis
 # partial regions (e.g. region=(1,2) on a 3-D array) will surface the
-# same upstream failure. Single-axis batched-1D — the docs reproducer
-# and PhasorNetworks' use case — works on every shape we've tried.
+# same upstream failure.
 function _make_complex_plan(X::oneAPI.oneArray{T,N}, region, inplace::Bool,
                             forward::Bool) where {T<:Union{ComplexF32,ComplexF64},N}
     R = length(region); reg = NTuple{R,Int}(region)
@@ -226,9 +244,10 @@ function _make_complex_plan(X::oneAPI.oneArray{T,N}, region, inplace::Bool,
         desc, q = _create_descriptor(size(X), T, true)
         onemklDftSetValueConfigValue(desc, ONEMKL_DFT_PARAM_PLACEMENT, placement)
         stc = onemklDftCommit(desc, q); stc == 0 || error("commit failed ($stc)")
-        return cMKLFFTPlan{T,K,inplace,N,R,Nothing}(desc, q, size(X), size(X),
+        plan = cMKLFFTPlan{T,K,inplace,N,R,Nothing}(desc, q, size(X), size(X),
                                                     false, reg, nothing, nothing,
                                                     1, prod(Int, size(X); init=1))
+        return _attach_descriptor_finalizer!(plan)
     end
 
     # Partial-region path: descriptor lengths = just the transform axes,
@@ -251,9 +270,10 @@ function _make_complex_plan(X::oneAPI.oneArray{T,N}, region, inplace::Bool,
     end
 
     stc = onemklDftCommit(desc, q); stc == 0 || error("commit failed ($stc)")
-    return cMKLFFTPlan{T,K,inplace,N,R,Nothing}(desc, q, size(X), size(X),
+    plan = cMKLFFTPlan{T,K,inplace,N,R,Nothing}(desc, q, size(X), size(X),
                                                 false, reg, nothing, nothing,
                                                 cfg.outer_count, cfg.in_outer_stride)
+    return _attach_descriptor_finalizer!(plan)
 end
 
 plan_fft(X::oneAPI.oneArray{T,N}, region) where {T<:Union{ComplexF32,ComplexF64},N} =
@@ -332,9 +352,10 @@ function _plan_rfft_1d(X::oneAPI.oneArray{T,N}, reg::NTuple{1,Int}) where {T<:Un
 
     stc = onemklDftCommit(desc, q); stc == 0 || error("commit failed ($stc)")
     R = length(reg)
-    rMKLFFTPlan{T,MKLFFT_FORWARD,false,N,R,typeof(buffer)}(
+    plan = rMKLFFTPlan{T,MKLFFT_FORWARD,false,N,R,typeof(buffer)}(
         desc, q, xdims, ydims, :rfft, reg, buffer, nothing,
         cfg.outer_count, cfg.in_outer_stride, cfg.out_outer_stride)
+    return _attach_descriptor_finalizer!(plan)
 end
 
 # Multi-dimensional real FFT using complex FFT approach
@@ -446,11 +467,12 @@ function _plan_brfft_1d(X::oneAPI.oneArray{T,N}, d::Integer, reg::NTuple{1,Int})
     R = length(reg)
     # in_outer_stride is for the INPUT array (complex, xdims);
     # out_outer_stride is for the OUTPUT array (real, ydims).
-    rMKLFFTPlan{T,MKLFFT_INVERSE,false,N,R,typeof(buffer)}(
+    plan = rMKLFFTPlan{T,MKLFFT_INVERSE,false,N,R,typeof(buffer)}(
         desc, q, xdims, ydims, :brfft, reg, buffer, nothing,
         cfg.outer_count,
         prod(Int, xdims[1:reg[1]]; init=1),
         prod(Int, ydims[1:reg[1]]; init=1))
+    return _attach_descriptor_finalizer!(plan)
 end
 
 # Multi-dimensional real inverse FFT using complex FFT approach
