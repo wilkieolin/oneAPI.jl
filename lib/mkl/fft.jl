@@ -40,6 +40,8 @@ mutable struct cMKLFFTPlan{T,K,inplace,N,R,B} <: MKLFFTPlan{T,K,inplace}
     region::NTuple{R,Int}
     buffer::B
     pinv::Any
+    outer_count::Int        # execute-time loop trip count (1 = no loop)
+    outer_stride::Int       # element stride per outer slice (input == output for complex)
 end
 
 # Real transforms use separate struct (mirroring AMDGPU style) for buffer staging
@@ -52,6 +54,9 @@ mutable struct rMKLFFTPlan{T,K,inplace,N,R,B} <: MKLFFTPlan{T,K,inplace}
     region::NTuple{R,Int}
     buffer::B
     pinv::Any
+    outer_count::Int        # execute-time loop trip count
+    in_outer_stride::Int    # element stride per outer slice (input layout)
+    out_outer_stride::Int   # element stride per outer slice (output layout)
 end
 
 # Inverse plan constructors (derive from existing plan)
@@ -61,23 +66,23 @@ function normalization_factor(sz, region)
 end
 
 function plan_inv(p::cMKLFFTPlan{T,MKLFFT_FORWARD,inplace,N,R,B}) where {T,inplace,N,R,B}
-    q = cMKLFFTPlan{T,MKLFFT_INVERSE,inplace,N,R,B}(p.handle,p.queue,p.sz,p.osz,p.realdomain,p.region,p.buffer,p)
+    q = cMKLFFTPlan{T,MKLFFT_INVERSE,inplace,N,R,B}(p.handle,p.queue,p.sz,p.osz,p.realdomain,p.region,p.buffer,p,p.outer_count,p.outer_stride)
     p.pinv = q
     ScaledPlan(q, 1/normalization_factor(p.sz, p.region))
 end
 function plan_inv(p::cMKLFFTPlan{T,MKLFFT_INVERSE,inplace,N,R,B}) where {T,inplace,N,R,B}
-    q = cMKLFFTPlan{T,MKLFFT_FORWARD,inplace,N,R,B}(p.handle,p.queue,p.sz,p.osz,p.realdomain,p.region,p.buffer,p)
+    q = cMKLFFTPlan{T,MKLFFT_FORWARD,inplace,N,R,B}(p.handle,p.queue,p.sz,p.osz,p.realdomain,p.region,p.buffer,p,p.outer_count,p.outer_stride)
     p.pinv = q
     ScaledPlan(q, 1/normalization_factor(p.sz, p.region))
 end
 
 function plan_inv(p::rMKLFFTPlan{T,MKLFFT_FORWARD,inplace,N,R,B}) where {T,inplace,N,R,B}
-    q = rMKLFFTPlan{T,MKLFFT_INVERSE,inplace,N,R,B}(p.handle,p.queue,p.sz,p.osz,:brfft,p.region,p.buffer,p)
+    q = rMKLFFTPlan{T,MKLFFT_INVERSE,inplace,N,R,B}(p.handle,p.queue,p.sz,p.osz,:brfft,p.region,p.buffer,p,p.outer_count,p.in_outer_stride,p.out_outer_stride)
     p.pinv = q
     ScaledPlan(q, 1/normalization_factor(p.sz, p.region))
 end
 function plan_inv(p::rMKLFFTPlan{T,MKLFFT_INVERSE,inplace,N,R,B}) where {T,inplace,N,R,B}
-    q = rMKLFFTPlan{T,MKLFFT_FORWARD,inplace,N,R,B}(p.handle,p.queue,p.sz,p.osz,:rfft,p.region,p.buffer,p)
+    q = rMKLFFTPlan{T,MKLFFT_FORWARD,inplace,N,R,B}(p.handle,p.queue,p.sz,p.osz,:rfft,p.region,p.buffer,p,p.outer_count,p.in_outer_stride,p.out_outer_stride)
     p.pinv = q
     ScaledPlan(q, 1/normalization_factor(p.sz, p.region))
 end
@@ -86,6 +91,86 @@ function Base.show(io::IO, p::MKLFFTPlan{T,K,inplace}) where {T,K,inplace}
     print(io, inplace ? "oneMKL FFT in-place " : "oneMKL FFT ", K ? "forward" : "inverse", " plan for ")
     if isempty(p.sz); print(io, "0-dimensional") else print(io, join(p.sz, "×")) end
     print(io, " oneArray of ", T)
+end
+
+# Batched descriptor configuration
+#
+# For a region whose first/last transform axes are first_t/last_t:
+#   inner-batch dims  = size[1 : first_t-1]    -> NUMBER_OF_TRANSFORMS + DISTANCE=1
+#   transform dims    = size[first_t : last_t] -> descriptor lengths + STRIDES
+#   outer-batch dims  = size[last_t+1 : N]     -> Julia-side execute-time loop
+# When inner_batch == 1, fold outer into NUMBER_OF_TRANSFORMS to avoid the loop.
+# sz/osz: full input/output array shapes (osz==sz for complex; differ on the
+# reduction axis for real plans).
+struct _BatchedCfg
+    transform_lengths::Vector{Int64}   # column-major rank order
+    fwd_strides::Vector{Int64}         # [0, s1, ..., sK] in input layout
+    bwd_strides::Vector{Int64}         # [0, s1, ..., sK] in output layout
+    num_transforms::Int
+    fwd_distance::Int
+    bwd_distance::Int
+    outer_count::Int                   # execute-time loop trip count (1 = no loop)
+    in_outer_stride::Int               # element stride per outer slice (input)
+    out_outer_stride::Int              # element stride per outer slice (output)
+end
+
+function _batched_descriptor_config(sz::NTuple{N,Int}, osz::NTuple{N,Int},
+                                    region::NTuple{R,Int};
+                                    fold_outer::Bool=true) where {N,R}
+    rs = sort(collect(region))
+    first_t, last_t = rs[1], rs[end]
+    rs == collect(first_t:last_t) ||
+        throw(ArgumentError("oneAPI.jl FFT region must be a contiguous range; got $region"))
+    (first_t >= 1 && last_t <= N) ||
+        throw(ArgumentError("FFT region $region out of bounds for $N-dim array"))
+
+    transform_lengths = Int64[sz[d] for d in first_t:last_t]
+
+    fwd_strides = Vector{Int64}(undef, R+1); fwd_strides[1] = 0
+    let p = 1
+        for i in 1:(first_t-1); p *= sz[i]; end
+        for k in 1:R
+            fwd_strides[k+1] = p
+            p *= sz[first_t + k - 1]
+        end
+    end
+    bwd_strides = Vector{Int64}(undef, R+1); bwd_strides[1] = 0
+    let p = 1
+        for i in 1:(first_t-1); p *= osz[i]; end
+        for k in 1:R
+            bwd_strides[k+1] = p
+            p *= osz[first_t + k - 1]
+        end
+    end
+
+    inner_batch = 1
+    for i in 1:(first_t-1); inner_batch *= sz[i]; end
+    outer_batch = 1
+    for i in (last_t+1):N; outer_batch *= sz[i]; end
+
+    in_outer_stride  = prod(Int, sz[1:last_t]; init=1)
+    out_outer_stride = prod(Int, osz[1:last_t]; init=1)
+
+    if inner_batch > 1
+        num_transforms = inner_batch
+        fwd_distance   = 1
+        bwd_distance   = 1
+        outer_count    = outer_batch
+    elseif fold_outer && outer_batch > 1
+        num_transforms = outer_batch
+        fwd_distance   = in_outer_stride
+        bwd_distance   = out_outer_stride
+        outer_count    = 1
+    else
+        num_transforms = 1
+        fwd_distance   = prod(Int, transform_lengths; init=1)
+        bwd_distance   = fwd_distance
+        outer_count    = 1
+    end
+
+    return _BatchedCfg(transform_lengths, fwd_strides, bwd_strides,
+                       num_transforms, fwd_distance, bwd_distance,
+                       outer_count, in_outer_stride, out_outer_stride)
 end
 
 # Plan constructors
@@ -108,88 +193,45 @@ function _create_descriptor(sz::NTuple{N,Int}, T::Type, complex::Bool) where {N}
     return desc, q
 end
 
-# Complex plans
-function plan_fft(X::oneAPI.oneArray{T,N}, region) where {T<:Union{ComplexF32,ComplexF64},N}
+# Complex plans — shared implementation
+function _make_complex_plan(X::oneAPI.oneArray{T,N}, region, inplace::Bool,
+                            forward::Bool) where {T<:Union{ComplexF32,ComplexF64},N}
     R = length(region); reg = NTuple{R,Int}(region)
-    # For now, only support full transforms (all dimensions)
-    if reg != ntuple(identity, N)
-        error("Partial dimension FFT not yet supported. Region $reg must be $(ntuple(identity, N))")
+    cfg = _batched_descriptor_config(size(X), size(X), reg)
+
+    desc, q = _create_descriptor(Tuple(cfg.transform_lengths), T, true)
+    placement = inplace ? ONEMKL_DFT_VALUE_INPLACE : ONEMKL_DFT_VALUE_NOT_INPLACE
+    onemklDftSetValueConfigValue(desc, ONEMKL_DFT_PARAM_PLACEMENT, placement)
+
+    # Always set strides — partial-region inner-batch encoding needs them
+    # even for 1D transform descriptors.
+    GC.@preserve cfg begin
+        onemklDftSetValueInt64Array(desc, ONEMKL_DFT_PARAM_FWD_STRIDES,
+                                    pointer(cfg.fwd_strides), length(cfg.fwd_strides))
+        onemklDftSetValueInt64Array(desc, ONEMKL_DFT_PARAM_BWD_STRIDES,
+                                    pointer(cfg.bwd_strides), length(cfg.bwd_strides))
     end
-    desc, q = _create_descriptor(size(X), T, true)
-    onemklDftSetValueConfigValue(desc, ONEMKL_DFT_PARAM_PLACEMENT, ONEMKL_DFT_VALUE_NOT_INPLACE)
-    if N > 1
-        # Column-major strides: stride along dimension i is product of sizes of previous dims
-        strides = Vector{Int64}(undef, N+1); strides[1]=0
-        prod = 1
-        @inbounds for i in 1:N
-            strides[i+1] = prod
-            prod *= size(X,i)
-        end
-        onemklDftSetValueInt64Array(desc, ONEMKL_DFT_PARAM_FWD_STRIDES, pointer(strides), length(strides))
-        onemklDftSetValueInt64Array(desc, ONEMKL_DFT_PARAM_BWD_STRIDES, pointer(strides), length(strides))
+    if cfg.num_transforms > 1
+        onemklDftSetValueInt64(desc, ONEMKL_DFT_PARAM_NUMBER_OF_TRANSFORMS, Int64(cfg.num_transforms))
+        onemklDftSetValueInt64(desc, ONEMKL_DFT_PARAM_FWD_DISTANCE, Int64(cfg.fwd_distance))
+        onemklDftSetValueInt64(desc, ONEMKL_DFT_PARAM_BWD_DISTANCE, Int64(cfg.bwd_distance))
     end
+
     stc = onemklDftCommit(desc, q); stc == 0 || error("commit failed ($stc)")
-    return cMKLFFTPlan{T,MKLFFT_FORWARD,false,N,R,Nothing}(desc,q,size(X),size(X),false,reg,nothing,nothing)
-end
-function plan_bfft(X::oneAPI.oneArray{T,N}, region) where {T<:Union{ComplexF32,ComplexF64},N}
-    R = length(region); reg = NTuple{R,Int}(region)
-    # For now, only support full transforms (all dimensions)
-    if reg != ntuple(identity, N)
-        error("Partial dimension FFT not yet supported. Region $reg must be $(ntuple(identity, N))")
-    end
-    desc, q = _create_descriptor(size(X), T, true)
-    onemklDftSetValueConfigValue(desc, ONEMKL_DFT_PARAM_PLACEMENT, ONEMKL_DFT_VALUE_NOT_INPLACE)
-    if N > 1
-        strides = Vector{Int64}(undef, N+1); strides[1]=0; prod=1
-        @inbounds for i in 1:N
-            strides[i+1]=prod; prod*=size(X,i)
-        end
-        onemklDftSetValueInt64Array(desc, ONEMKL_DFT_PARAM_FWD_STRIDES, pointer(strides), length(strides))
-        onemklDftSetValueInt64Array(desc, ONEMKL_DFT_PARAM_BWD_STRIDES, pointer(strides), length(strides))
-    end
-    stc = onemklDftCommit(desc, q); stc == 0 || error("commit failed ($stc)")
-    return cMKLFFTPlan{T,MKLFFT_INVERSE,false,N,R,Nothing}(desc,q,size(X),size(X),false,reg,nothing,nothing)
+    K = forward ? MKLFFT_FORWARD : MKLFFT_INVERSE
+    return cMKLFFTPlan{T,K,inplace,N,R,Nothing}(desc, q, size(X), size(X),
+                                                false, reg, nothing, nothing,
+                                                cfg.outer_count, cfg.in_outer_stride)
 end
 
-# In-place (provide separate methods)
-function plan_fft!(X::oneAPI.oneArray{T,N}, region) where {T<:Union{ComplexF32,ComplexF64},N}
-    R = length(region); reg = NTuple{R,Int}(region)
-    # For now, only support full transforms (all dimensions)
-    if reg != ntuple(identity, N)
-        error("Partial dimension FFT not yet supported. Region $reg must be $(ntuple(identity, N))")
-    end
-    desc,q = _create_descriptor(size(X),T,true)
-    onemklDftSetValueConfigValue(desc, ONEMKL_DFT_PARAM_PLACEMENT, ONEMKL_DFT_VALUE_INPLACE)
-    if N > 1
-        strides = Vector{Int64}(undef, N+1); strides[1]=0; prod=1
-        @inbounds for i in 1:N
-            strides[i+1]=prod; prod*=size(X,i)
-        end
-        onemklDftSetValueInt64Array(desc, ONEMKL_DFT_PARAM_FWD_STRIDES, pointer(strides), length(strides))
-        onemklDftSetValueInt64Array(desc, ONEMKL_DFT_PARAM_BWD_STRIDES, pointer(strides), length(strides))
-    end
-    stc = onemklDftCommit(desc, q); stc == 0 || error("commit failed ($stc)")
-    cMKLFFTPlan{T,MKLFFT_FORWARD,true,N,R,Nothing}(desc,q,size(X),size(X),false,reg,nothing,nothing)
-end
-function plan_bfft!(X::oneAPI.oneArray{T,N}, region) where {T<:Union{ComplexF32,ComplexF64},N}
-    R = length(region); reg = NTuple{R,Int}(region)
-    # For now, only support full transforms (all dimensions)
-    if reg != ntuple(identity, N)
-        error("Partial dimension FFT not yet supported. Region $reg must be $(ntuple(identity, N))")
-    end
-    desc,q = _create_descriptor(size(X),T,true)
-    onemklDftSetValueConfigValue(desc, ONEMKL_DFT_PARAM_PLACEMENT, ONEMKL_DFT_VALUE_INPLACE)
-    if N > 1
-        strides = Vector{Int64}(undef, N+1); strides[1]=0; prod=1
-        @inbounds for i in 1:N
-            strides[i+1]=prod; prod*=size(X,i)
-        end
-        onemklDftSetValueInt64Array(desc, ONEMKL_DFT_PARAM_FWD_STRIDES, pointer(strides), length(strides))
-        onemklDftSetValueInt64Array(desc, ONEMKL_DFT_PARAM_BWD_STRIDES, pointer(strides), length(strides))
-    end
-    stc = onemklDftCommit(desc, q); stc == 0 || error("commit failed ($stc)")
-    cMKLFFTPlan{T,MKLFFT_INVERSE,true,N,R,Nothing}(desc,q,size(X),size(X),false,reg,nothing,nothing)
-end
+plan_fft(X::oneAPI.oneArray{T,N}, region) where {T<:Union{ComplexF32,ComplexF64},N} =
+    _make_complex_plan(X, region, false, true)
+plan_bfft(X::oneAPI.oneArray{T,N}, region) where {T<:Union{ComplexF32,ComplexF64},N} =
+    _make_complex_plan(X, region, false, false)
+plan_fft!(X::oneAPI.oneArray{T,N}, region) where {T<:Union{ComplexF32,ComplexF64},N} =
+    _make_complex_plan(X, region, true, true)
+plan_bfft!(X::oneAPI.oneArray{T,N}, region) where {T<:Union{ComplexF32,ComplexF64},N} =
+    _make_complex_plan(X, region, true, false)
 
 # Real input methods - convert to complex like FFTW does
 function plan_fft(X::oneAPI.oneArray{T,N}, region) where {T<:Union{Float32,Float64},N}
@@ -223,8 +265,7 @@ function plan_rfft(X::oneAPI.oneArray{T,N}, region) where {T<:Union{Float32,Floa
     R = length(region); reg = NTuple{R,Int}(region)
 
     # For single dimension transforms, use the optimized oneMKL real FFT
-    if R == 1 && reg[1] == 1
-        # Only support transform along first dimension for 1D case
+    if R == 1
         return _plan_rfft_1d(X, reg)
     end
 
@@ -233,29 +274,35 @@ function plan_rfft(X::oneAPI.oneArray{T,N}, region) where {T<:Union{Float32,Floa
     return _plan_rfft_nd(X, reg)
 end
 
-# Single-dimension real FFT using oneMKL (optimized path)
+# Single-dimension real FFT using oneMKL (optimized path) — arbitrary axis
 function _plan_rfft_1d(X::oneAPI.oneArray{T,N}, reg::NTuple{1,Int}) where {T<:Union{Float32,Float64},N}
-    # Create 1D descriptor for the transform dimension
-    desc,q = _create_descriptor((size(X, reg[1]),), T, false)
+    d = reg[1]
     xdims = size(X)
-    # output along first dim becomes N/2+1
-    ydims = Base.setindex(xdims, div(xdims[1],2)+1, 1)
-    buffer = oneAPI.oneArray{Complex{T}}(undef, ydims)
+    ydims = Base.setindex(xdims, div(xdims[d], 2) + 1, d)
+
+    cfg = _batched_descriptor_config(xdims, ydims, reg)
+
+    desc, q = _create_descriptor((xdims[d],), T, false)
+    buffer  = oneAPI.oneArray{Complex{T}}(undef, ydims)
     onemklDftSetValueConfigValue(desc, ONEMKL_DFT_PARAM_PLACEMENT, ONEMKL_DFT_VALUE_NOT_INPLACE)
 
-    # Set up for batched 1D transforms along first dimension
-    if N > 1
-        # Number of 1D transforms = product of all other dimensions
-        num_transforms = prod(xdims[2:end])
-        onemklDftSetValueInt64(desc, ONEMKL_DFT_PARAM_NUMBER_OF_TRANSFORMS, Int64(num_transforms))
-        # Distance between consecutive transforms (stride along batching dimension)
-        onemklDftSetValueInt64(desc, ONEMKL_DFT_PARAM_FWD_DISTANCE, Int64(xdims[1]))
-        onemklDftSetValueInt64(desc, ONEMKL_DFT_PARAM_BWD_DISTANCE, Int64(ydims[1]))
+    GC.@preserve cfg begin
+        onemklDftSetValueInt64Array(desc, ONEMKL_DFT_PARAM_FWD_STRIDES,
+                                    pointer(cfg.fwd_strides), length(cfg.fwd_strides))
+        onemklDftSetValueInt64Array(desc, ONEMKL_DFT_PARAM_BWD_STRIDES,
+                                    pointer(cfg.bwd_strides), length(cfg.bwd_strides))
+    end
+    if cfg.num_transforms > 1
+        onemklDftSetValueInt64(desc, ONEMKL_DFT_PARAM_NUMBER_OF_TRANSFORMS, Int64(cfg.num_transforms))
+        onemklDftSetValueInt64(desc, ONEMKL_DFT_PARAM_FWD_DISTANCE, Int64(cfg.fwd_distance))
+        onemklDftSetValueInt64(desc, ONEMKL_DFT_PARAM_BWD_DISTANCE, Int64(cfg.bwd_distance))
     end
 
     stc = onemklDftCommit(desc, q); stc == 0 || error("commit failed ($stc)")
     R = length(reg)
-    rMKLFFTPlan{T,MKLFFT_FORWARD,false,N,R,typeof(buffer)}(desc,q,xdims,ydims,:rfft,reg,buffer,nothing)
+    rMKLFFTPlan{T,MKLFFT_FORWARD,false,N,R,typeof(buffer)}(
+        desc, q, xdims, ydims, :rfft, reg, buffer, nothing,
+        cfg.outer_count, cfg.in_outer_stride, cfg.out_outer_stride)
 end
 
 # Multi-dimensional real FFT using complex FFT approach
@@ -325,8 +372,8 @@ function plan_brfft(X::oneAPI.oneArray{T,N}, d::Integer, region) where {T<:Union
     end
     R = length(region); reg = NTuple{R,Int}(region)
 
-    # For single dimension transforms along first dim, use optimized oneMKL path
-    if R == 1 && reg[1] == 1
+    # For single dimension transforms, use optimized oneMKL path (arbitrary axis)
+    if R == 1
         return _plan_brfft_1d(X, d, reg)
     end
 
@@ -334,28 +381,44 @@ function plan_brfft(X::oneAPI.oneArray{T,N}, d::Integer, region) where {T<:Union
     return _plan_brfft_nd(X, d, reg)
 end
 
-# Single-dimension real inverse FFT using oneMKL (optimized path)
+# Single-dimension real inverse FFT using oneMKL (optimized path) — arbitrary axis
 function _plan_brfft_1d(X::oneAPI.oneArray{T,N}, d::Integer, reg::NTuple{1,Int}) where {T<:Union{ComplexF32,ComplexF64},N}
-    # Extract underlying real type R from Complex{R}
     @assert T <: Complex
     RT = T.parameters[1]
+    ax = reg[1]
+    xdims = size(X)                                  # complex input (axis ax already reduced)
+    ydims = Base.setindex(xdims, d, ax)              # real output (axis ax expanded to d)
 
-    # Create 1D descriptor for the transform dimension
-    desc,q = _create_descriptor((d,), RT, false)
-    xdims = size(X)
-    ydims = Base.setindex(xdims, d, 1)
-    buffer = oneAPI.oneArray{T}(undef, xdims) # copy for safety
+    # oneMKL DISTANCE/STRIDES are layout properties tied to the forward (real) domain
+    # for FWD_* and the backward (complex) domain for BWD_*. For brfft the real layout
+    # is the OUTPUT and the complex layout is the INPUT — so pass (ydims, xdims).
+    cfg = _batched_descriptor_config(ydims, xdims, reg)
+
+    desc, q = _create_descriptor((d,), RT, false)
+    buffer  = oneAPI.oneArray{T}(undef, xdims)
     onemklDftSetValueConfigValue(desc, ONEMKL_DFT_PARAM_PLACEMENT, ONEMKL_DFT_VALUE_NOT_INPLACE)
 
-    # For now, disable batching for real inverse FFTs due to oneMKL parameter conflicts
-    # Use loop-based approach instead for multi-dimensional arrays
-    if N > 1
-        @info "Batched real inverse FFTs not yet supported by oneMKL - please use loop-based approach or 1D arrays"
+    GC.@preserve cfg begin
+        onemklDftSetValueInt64Array(desc, ONEMKL_DFT_PARAM_FWD_STRIDES,
+                                    pointer(cfg.fwd_strides), length(cfg.fwd_strides))
+        onemklDftSetValueInt64Array(desc, ONEMKL_DFT_PARAM_BWD_STRIDES,
+                                    pointer(cfg.bwd_strides), length(cfg.bwd_strides))
+    end
+    if cfg.num_transforms > 1
+        onemklDftSetValueInt64(desc, ONEMKL_DFT_PARAM_NUMBER_OF_TRANSFORMS, Int64(cfg.num_transforms))
+        onemklDftSetValueInt64(desc, ONEMKL_DFT_PARAM_FWD_DISTANCE, Int64(cfg.fwd_distance))
+        onemklDftSetValueInt64(desc, ONEMKL_DFT_PARAM_BWD_DISTANCE, Int64(cfg.bwd_distance))
     end
 
     stc = onemklDftCommit(desc, q); stc == 0 || error("commit failed ($stc)")
     R = length(reg)
-    rMKLFFTPlan{T,MKLFFT_INVERSE,false,N,R,typeof(buffer)}(desc,q,xdims,ydims,:brfft,reg,buffer,nothing)
+    # in_outer_stride is for the INPUT array (complex, xdims);
+    # out_outer_stride is for the OUTPUT array (real, ydims).
+    rMKLFFTPlan{T,MKLFFT_INVERSE,false,N,R,typeof(buffer)}(
+        desc, q, xdims, ydims, :brfft, reg, buffer, nothing,
+        cfg.outer_count,
+        prod(Int, xdims[1:reg[1]]; init=1),
+        prod(Int, ydims[1:reg[1]]; init=1))
 end
 
 # Multi-dimensional real inverse FFT using complex FFT approach
@@ -507,24 +570,51 @@ end
 
 # Execution helpers
 _rawptr(a::oneAPI.oneArray{T}) where T = reinterpret(Ptr{Cvoid}, pointer(a))
+@inline _ptr_at(a::oneAPI.oneArray{T}, k::Int, stride_elems::Int) where T =
+    reinterpret(Ptr{Cvoid}, pointer(a, 1 + k * stride_elems))
 
 function _exec!(p::cMKLFFTPlan{T,MKLFFT_FORWARD,true}, X::oneAPI.oneArray{T}) where T
-    st = onemklDftComputeForward(p.handle, _rawptr(X)); st==0 || error("forward FFT failed ($st)"); X
+    for k in 0:(p.outer_count - 1)
+        st = onemklDftComputeForward(p.handle, _ptr_at(X, k, p.outer_stride))
+        st == 0 || error("forward FFT failed ($st)")
+    end
+    X
 end
 function _exec!(p::cMKLFFTPlan{T,MKLFFT_INVERSE,true}, X::oneAPI.oneArray{T}) where T
-    st = onemklDftComputeBackward(p.handle, _rawptr(X)); st==0 || error("inverse FFT failed ($st)"); X
+    for k in 0:(p.outer_count - 1)
+        st = onemklDftComputeBackward(p.handle, _ptr_at(X, k, p.outer_stride))
+        st == 0 || error("inverse FFT failed ($st)")
+    end
+    X
 end
 function _exec!(p::cMKLFFTPlan{T,K,false}, X::oneAPI.oneArray{T}, Y::oneAPI.oneArray{T}) where {T,K}
-    st = (K==MKLFFT_FORWARD ? onemklDftComputeForwardOutOfPlace : onemklDftComputeBackwardOutOfPlace)(p.handle, _rawptr(X), _rawptr(Y)); st==0 || error("FFT failed ($st)"); Y
+    fn = K == MKLFFT_FORWARD ? onemklDftComputeForwardOutOfPlace : onemklDftComputeBackwardOutOfPlace
+    for k in 0:(p.outer_count - 1)
+        st = fn(p.handle, _ptr_at(X, k, p.outer_stride), _ptr_at(Y, k, p.outer_stride))
+        st == 0 || error("FFT failed ($st)")
+    end
+    Y
 end
 
 # Real forward
 function _exec!(p::rMKLFFTPlan{T,MKLFFT_FORWARD,false}, X::oneAPI.oneArray{T}, Y::oneAPI.oneArray{Complex{T}}) where T
-    st = onemklDftComputeForwardOutOfPlace(p.handle, _rawptr(X), _rawptr(Y)); st==0 || error("rfft failed ($st)"); Y
+    for k in 0:(p.outer_count - 1)
+        st = onemklDftComputeForwardOutOfPlace(p.handle,
+                _ptr_at(X, k, p.in_outer_stride),
+                _ptr_at(Y, k, p.out_outer_stride))
+        st == 0 || error("rfft failed ($st)")
+    end
+    Y
 end
 # Real inverse (complex -> real)
 function _exec!(p::rMKLFFTPlan{T,MKLFFT_INVERSE,false}, X::oneAPI.oneArray{T}, Y::oneAPI.oneArray{R}) where {R,T<:Complex{R}}
-    st = onemklDftComputeBackwardOutOfPlace(p.handle, _rawptr(X), _rawptr(Y)); st==0 || error("brfft failed ($st)"); Y
+    for k in 0:(p.outer_count - 1)
+        st = onemklDftComputeBackwardOutOfPlace(p.handle,
+                _ptr_at(X, k, p.in_outer_stride),
+                _ptr_at(Y, k, p.out_outer_stride))
+        st == 0 || error("brfft failed ($st)")
+    end
+    Y
 end
 
 # Public API similar to AMDGPU

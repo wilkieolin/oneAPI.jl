@@ -79,4 +79,57 @@ end
         end
     end
 end
+
+@testset "partial region" begin
+    # 2D complex — every single-dim and full-region case
+    @testset "2D ComplexF32 region=$reg" for reg in [(1,), (2,), (1, 2)]
+        X = rand(ComplexF32, 16, 24)
+        dX = gpu(X)
+        cmp(AbstractFFTs.fft(dX, reg), AbstractFFTs.fft(X, reg))
+        cmp(AbstractFFTs.bfft(dX, reg), AbstractFFTs.bfft(X, reg))
+        p  = AbstractFFTs.plan_fft(dX, reg)
+        cmp(p * dX, AbstractFFTs.fft(X, reg))
+        # round-trip via inverse
+        cmp(inv(p) * (p * dX), dX)
+        # in-place
+        dXi = copy(dX); AbstractFFTs.plan_fft!(dXi, reg) * dXi
+        cmp(dXi, AbstractFFTs.fft(X, reg))
+    end
+
+    # 3D complex — leading, trailing, middle, and multi-dim contiguous regions
+    @testset "3D ComplexF32 region=$reg" for reg in [(1,), (2,), (3,), (1, 2), (2, 3), (1, 2, 3)]
+        X = rand(ComplexF32, 8, 12, 6)
+        dX = gpu(X)
+        cmp(AbstractFFTs.fft(dX, reg), AbstractFFTs.fft(X, reg))
+        cmp(AbstractFFTs.bfft(dX, reg), AbstractFFTs.bfft(X, reg))
+        p = AbstractFFTs.plan_fft(dX, reg)
+        cmp(p * dX, AbstractFFTs.fft(X, reg))
+        cmp(inv(p) * (p * dX), dX)
+    end
+
+    # Audio shape from docs/oneapi_fft_batched_1d.md — kept modest in tests
+    # to avoid the 256 MB allocation, but exercises the same code path.
+    @testset "audio-shaped batched 1D" begin
+        X = rand(ComplexF32, 64, 1024, 4)   # (C, N, B) with N along dim 2
+        dX = gpu(X)
+        cmp(AbstractFFTs.fft(dX, (2,)), AbstractFFTs.fft(X, (2,)))
+    end
+
+    # Single-dim real (rfft / brfft / irfft) — arbitrary axis
+    @testset "Float32 rfft/brfft/irfft region=$reg" for reg in [(1,), (2,), (3,)]
+        X = rand(Float32, 8, 12, 6)
+        dX = gpu(X)
+        Yref = AbstractFFTs.rfft(X, reg)
+        cmp(AbstractFFTs.rfft(dX, reg), Yref)
+        dY = gpu(Yref)
+        d = size(X, reg[1])
+        cmp(AbstractFFTs.brfft(dY, d, reg), AbstractFFTs.brfft(Yref, d, reg))
+        cmp(AbstractFFTs.irfft(dY, d, reg), AbstractFFTs.irfft(Yref, d, reg))
+    end
+
+    # Non-contiguous regions must error cleanly
+    @testset "non-contiguous region errors" begin
+        @test_throws ArgumentError AbstractFFTs.plan_fft(gpu(rand(ComplexF32, 4, 5, 6)), (1, 3))
+    end
+end
 end
