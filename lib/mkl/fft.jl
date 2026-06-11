@@ -193,24 +193,53 @@ function _create_descriptor(sz::NTuple{N,Int}, T::Type, complex::Bool) where {N}
     return desc, q
 end
 
-# Complex plans — shared implementation
+# Complex plans — shared implementation.
+#
+# For the full-region case (reg == (1,2,…,N)) we reproduce the historical
+# code path byte-for-byte: a descriptor over size(X) with column-major
+# strides over size(X), no NUMBER_OF_TRANSFORMS / DISTANCE set. This is
+# the path that has been known to work on Aurora.
+#
+# For partial regions we build a smaller descriptor (just the transform
+# axes) and use NUMBER_OF_TRANSFORMS + DISTANCE for inner batching plus an
+# execute-time loop for outer batching (see _exec!).
 function _make_complex_plan(X::oneAPI.oneArray{T,N}, region, inplace::Bool,
                             forward::Bool) where {T<:Union{ComplexF32,ComplexF64},N}
     R = length(region); reg = NTuple{R,Int}(region)
-    cfg = _batched_descriptor_config(size(X), size(X), reg)
-
-    desc, q = _create_descriptor(Tuple(cfg.transform_lengths), T, true)
     placement = inplace ? ONEMKL_DFT_VALUE_INPLACE : ONEMKL_DFT_VALUE_NOT_INPLACE
+    K = forward ? MKLFFT_FORWARD : MKLFFT_INVERSE
+    full_region = reg == ntuple(identity, N)
+
+    if full_region
+        # Historical full-region path — matches the pre-batched-FFT code exactly.
+        desc, q = _create_descriptor(size(X), T, true)
+        onemklDftSetValueConfigValue(desc, ONEMKL_DFT_PARAM_PLACEMENT, placement)
+        if N > 1
+            strides = Vector{Int64}(undef, N+1); strides[1] = 0
+            p = 1
+            @inbounds for i in 1:N
+                strides[i+1] = p
+                p *= size(X, i)
+            end
+            onemklDftSetValueInt64Array(desc, ONEMKL_DFT_PARAM_FWD_STRIDES, pointer(strides), length(strides))
+            onemklDftSetValueInt64Array(desc, ONEMKL_DFT_PARAM_BWD_STRIDES, pointer(strides), length(strides))
+        end
+        stc = onemklDftCommit(desc, q); stc == 0 || error("commit failed ($stc)")
+        return cMKLFFTPlan{T,K,inplace,N,R,Nothing}(desc, q, size(X), size(X),
+                                                    false, reg, nothing, nothing,
+                                                    1, prod(Int, size(X); init=1))
+    end
+
+    # Partial-region path: descriptor lengths = just the transform axes,
+    # batching encoded via NUMBER_OF_TRANSFORMS + DISTANCE + STRIDES.
+    cfg = _batched_descriptor_config(size(X), size(X), reg)
+    desc, q = _create_descriptor(Tuple(cfg.transform_lengths), T, true)
     onemklDftSetValueConfigValue(desc, ONEMKL_DFT_PARAM_PLACEMENT, placement)
 
-    # Always set strides — partial-region inner-batch encoding needs them
-    # even for 1D transform descriptors.
-    GC.@preserve cfg begin
-        onemklDftSetValueInt64Array(desc, ONEMKL_DFT_PARAM_FWD_STRIDES,
-                                    pointer(cfg.fwd_strides), length(cfg.fwd_strides))
-        onemklDftSetValueInt64Array(desc, ONEMKL_DFT_PARAM_BWD_STRIDES,
-                                    pointer(cfg.bwd_strides), length(cfg.bwd_strides))
-    end
+    fwd_strides = cfg.fwd_strides
+    bwd_strides = cfg.bwd_strides
+    onemklDftSetValueInt64Array(desc, ONEMKL_DFT_PARAM_FWD_STRIDES, pointer(fwd_strides), length(fwd_strides))
+    onemklDftSetValueInt64Array(desc, ONEMKL_DFT_PARAM_BWD_STRIDES, pointer(bwd_strides), length(bwd_strides))
     if cfg.num_transforms > 1
         onemklDftSetValueInt64(desc, ONEMKL_DFT_PARAM_NUMBER_OF_TRANSFORMS, Int64(cfg.num_transforms))
         onemklDftSetValueInt64(desc, ONEMKL_DFT_PARAM_FWD_DISTANCE, Int64(cfg.fwd_distance))
@@ -218,7 +247,6 @@ function _make_complex_plan(X::oneAPI.oneArray{T,N}, region, inplace::Bool,
     end
 
     stc = onemklDftCommit(desc, q); stc == 0 || error("commit failed ($stc)")
-    K = forward ? MKLFFT_FORWARD : MKLFFT_INVERSE
     return cMKLFFTPlan{T,K,inplace,N,R,Nothing}(desc, q, size(X), size(X),
                                                 false, reg, nothing, nothing,
                                                 cfg.outer_count, cfg.in_outer_stride)
