@@ -211,19 +211,12 @@ function _make_complex_plan(X::oneAPI.oneArray{T,N}, region, inplace::Bool,
     full_region = reg == ntuple(identity, N)
 
     if full_region
-        # Historical full-region path — matches the pre-batched-FFT code exactly.
+        # Full-region: descriptor lengths already match the array layout, so
+        # oneMKL's default column-major strides are correct — don't set any
+        # STRIDES (the current support-library build rejects explicit
+        # FWD/BWD_STRIDES on multi-D descriptors).
         desc, q = _create_descriptor(size(X), T, true)
         onemklDftSetValueConfigValue(desc, ONEMKL_DFT_PARAM_PLACEMENT, placement)
-        if N > 1
-            strides = Vector{Int64}(undef, N+1); strides[1] = 0
-            p = 1
-            @inbounds for i in 1:N
-                strides[i+1] = p
-                p *= size(X, i)
-            end
-            onemklDftSetValueInt64Array(desc, ONEMKL_DFT_PARAM_FWD_STRIDES, pointer(strides), length(strides))
-            onemklDftSetValueInt64Array(desc, ONEMKL_DFT_PARAM_BWD_STRIDES, pointer(strides), length(strides))
-        end
         stc = onemklDftCommit(desc, q); stc == 0 || error("commit failed ($stc)")
         return cMKLFFTPlan{T,K,inplace,N,R,Nothing}(desc, q, size(X), size(X),
                                                     false, reg, nothing, nothing,
@@ -232,14 +225,17 @@ function _make_complex_plan(X::oneAPI.oneArray{T,N}, region, inplace::Bool,
 
     # Partial-region path: descriptor lengths = just the transform axes,
     # batching encoded via NUMBER_OF_TRANSFORMS + DISTANCE + STRIDES.
+    # Use INPUT_STRIDES / OUTPUT_STRIDES (the older oneMKL DFT API) rather
+    # than FWD_STRIDES / BWD_STRIDES — the latter trip commit failures on
+    # the current Aurora support-library build for multi-D descriptors.
     cfg = _batched_descriptor_config(size(X), size(X), reg)
     desc, q = _create_descriptor(Tuple(cfg.transform_lengths), T, true)
     onemklDftSetValueConfigValue(desc, ONEMKL_DFT_PARAM_PLACEMENT, placement)
 
     fwd_strides = cfg.fwd_strides
     bwd_strides = cfg.bwd_strides
-    onemklDftSetValueInt64Array(desc, ONEMKL_DFT_PARAM_FWD_STRIDES, pointer(fwd_strides), length(fwd_strides))
-    onemklDftSetValueInt64Array(desc, ONEMKL_DFT_PARAM_BWD_STRIDES, pointer(bwd_strides), length(bwd_strides))
+    onemklDftSetValueInt64Array(desc, ONEMKL_DFT_PARAM_INPUT_STRIDES, pointer(fwd_strides), length(fwd_strides))
+    onemklDftSetValueInt64Array(desc, ONEMKL_DFT_PARAM_OUTPUT_STRIDES, pointer(bwd_strides), length(bwd_strides))
     if cfg.num_transforms > 1
         onemklDftSetValueInt64(desc, ONEMKL_DFT_PARAM_NUMBER_OF_TRANSFORMS, Int64(cfg.num_transforms))
         onemklDftSetValueInt64(desc, ONEMKL_DFT_PARAM_FWD_DISTANCE, Int64(cfg.fwd_distance))
