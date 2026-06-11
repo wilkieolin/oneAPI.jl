@@ -197,12 +197,20 @@ end
 #
 # For the full-region case (reg == (1,2,…,N)) we reproduce the historical
 # code path byte-for-byte: a descriptor over size(X) with column-major
-# strides over size(X), no NUMBER_OF_TRANSFORMS / DISTANCE set. This is
-# the path that has been known to work on Aurora.
+# strides over size(X), no NUMBER_OF_TRANSFORMS / DISTANCE set.
 #
 # For partial regions we build a smaller descriptor (just the transform
 # axes) and use NUMBER_OF_TRANSFORMS + DISTANCE for inner batching plus an
 # execute-time loop for outer batching (see _exec!).
+#
+# KNOWN LIMITATION (pre-existing, not introduced here): on at least the
+# Aurora support-library build, ANY multi-D oneMKL DFT descriptor (rank
+# 2+) fails at commit time — bare upstream `fft(rand(ComplexF32,8,32))`
+# already throws "commit failed (-1)". As a result, only single-axis
+# partial-region transforms are reliably batched here; multi-axis
+# partial regions (e.g. region=(1,2) on a 3-D array) will surface the
+# same upstream failure. Single-axis batched-1D — the docs reproducer
+# and PhasorNetworks' use case — works on every shape we've tried.
 function _make_complex_plan(X::oneAPI.oneArray{T,N}, region, inplace::Bool,
                             forward::Bool) where {T<:Union{ComplexF32,ComplexF64},N}
     R = length(region); reg = NTuple{R,Int}(region)
