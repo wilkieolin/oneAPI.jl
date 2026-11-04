@@ -165,4 +165,54 @@ end
     Z = abs.(Y)
     cmp(Z, abs.(fft(hX .* 2f0)))
 end
+
+@testset "descriptor release" begin
+    FFTm = oneAPI.oneMKL.FFT
+    destroyed() = FFTm.DFT_DESTROY_COUNT[]
+    X = rand(ComplexF32, 64, 8)
+    dX = gpu(X)
+
+    # plans dropped by the convenience functions are destroyed after a collection
+    GC.gc(true); FFTm.flush_deferred_dft_releases()
+    n0 = destroyed()
+    for _ in 1:20
+        fft(dX, 1); bfft(dX, 1); ifft(dX, 1)
+    end
+    rX = rand(Float32, 64, 8)
+    drX = gpu(rX)
+    for _ in 1:5
+        rfft(drX, 1)
+    end
+    GC.gc(true); FFTm.flush_deferred_dft_releases()
+    @test destroyed() - n0 >= 65
+    @test isempty(FFTm._deferred_dft_descriptors)
+
+    # an inverse plan keeps the descriptor it shares with its forward plan alive
+    q = inv(AbstractFFTs.plan_fft(dX, 1))
+    GC.gc(true); FFTm.flush_deferred_dft_releases()
+    cmp(q * gpu(fft(X, 1)), X)
+
+    # finalize releases a plan early, exactly once
+    p = AbstractFFTs.plan_fft(dX, 1)
+    cmp(p * dX, fft(X, 1))
+    n1 = destroyed()
+    finalize(p)
+    @test p.handle == C_NULL
+    finalize(p)
+    FFTm.flush_deferred_dft_releases()
+    @test destroyed() == n1 + 1
+
+    # plans alone trigger collections: in-place transforms allocate almost nothing a
+    # collector can see, and without this the descriptors fill the device
+    n2 = destroyed()
+    Y = gpu(rand(ComplexF32, 64, 8))
+    for _ in 1:2FFTm._PLANS_PER_GC
+        fft!(Y, 1)
+    end
+    synchronize()
+    @test destroyed() - n2 >= FFTm._PLANS_PER_GC ÷ 2
+
+    # plans made after a release still work
+    cmp(fft(dX, 1), fft(X, 1))
+end
 end

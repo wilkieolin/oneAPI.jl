@@ -58,6 +58,84 @@ mutable struct rMKLFFTPlan{T,K,inplace,N,R,B} <: MKLFFTPlan{T,K,inplace}
     pinv::Any
 end
 
+# Descriptor lifetime. Every plan commits its own oneMKL descriptor, which holds device
+# memory outside the oneAPI.jl pool (tens of MiB for long transforms), so plans must
+# destroy it or the device fills up. Only the plan that committed a descriptor owns it:
+# inverse plans from `plan_inv` share the handle and keep the owner alive through `pinv`.
+# As with sparse handles, finalizers only queue the descriptor; it is destroyed on a
+# regular task, once all streams have finished the work that may still use it, at the
+# next plan creation or when memory is reclaimed. `finalize(p)` releases a plan early,
+# together with the inverse plans made from it.
+const _deferred_dft_descriptors = Vector{onemklDftDescriptor_t}()
+const _deferred_dft_descriptors_lock = Threads.SpinLock()
+
+# number of descriptors destroyed so far; observable for tests
+const DFT_DESTROY_COUNT = Threads.Atomic{Int}(0)
+
+function _release_plan(p::Union{cMKLFFTPlan, rMKLFFTPlan})
+    p.handle == C_NULL && return
+    lock(_deferred_dft_descriptors_lock) do
+        push!(_deferred_dft_descriptors, p.handle)
+    end
+    p.handle = C_NULL
+    return
+end
+
+# Descriptors are invisible to both garbage collectors: Julia sees a small plan object,
+# and the pool's GC trigger doesn't count their device memory. A loop that makes plans
+# and little else (e.g. `fft!`) would therefore fill the device before any finalizer
+# runs. So plan creation asks for a collection itself, after `_PLANS_PER_GC` plans or
+# when the arrays planned for since the last one add up to `_PLAN_GC_FRACTION` of the
+# device budget (array size being a stand-in, as the descriptor's size is not exposed).
+# Plans that outlive a young collection need a full one, hence every fourth.
+const _PLANS_PER_GC = 256
+const _PLAN_GC_FRACTION = 0.1
+const _plans_since_gc = Threads.Atomic{Int}(0)
+const _plan_bytes_since_gc = Threads.Atomic{Int}(0)
+const _plan_gcs = Threads.Atomic{Int}(0)
+
+function _maybe_gc_for_plans(bytes::Int)
+    plans = Threads.atomic_add!(_plans_since_gc, 1) + 1
+    planned = Threads.atomic_add!(_plan_bytes_since_gc, bytes) + bytes
+    budget = _PLAN_GC_FRACTION * oneAPI._memory_limit(oneAPI.device())
+    (plans >= _PLANS_PER_GC || planned >= budget) || return
+    _plans_since_gc[] = 0
+    _plan_bytes_since_gc[] = 0
+    GC.gc(Threads.atomic_add!(_plan_gcs, 1) % 4 == 3)
+    return
+end
+
+function _own(p::Union{cMKLFFTPlan, rMKLFFTPlan}, X::oneAPI.oneArray)
+    finalizer(_release_plan, p)
+    _maybe_gc_for_plans(sizeof(X))
+    return p
+end
+
+function flush_deferred_dft_releases()
+    GC.enable_finalizers(false)
+    descs = try
+        lock(_deferred_dft_descriptors_lock) do
+            d = copy(_deferred_dft_descriptors)
+            empty!(_deferred_dft_descriptors)
+            d
+        end
+    finally
+        GC.enable_finalizers(true)
+    end
+    isempty(descs) && return
+    # descriptors are not queue-ordered objects, so retire every stream that may still
+    # execute one (on the LTS stack plans can be used from any task) before destroying
+    ctx = oneAPI.context(); dev = oneAPI.device()
+    oneAPI.synchronize_all_streams(ctx, dev)
+    oneAPI.synchronize()
+    for desc in descs
+        st = onemklDftDestroy(desc)
+        st == 0 || @warn "Error destroying oneMKL DFT descriptor (status $st)"
+        Threads.atomic_add!(DFT_DESTROY_COUNT, 1)
+    end
+    return
+end
+
 # Inverse plan constructors (derive from existing plan)
 function normalization_factor(sz, region)
     # AbstractFFTs expects inverse to scale by 1/prod(lengths along region)
@@ -101,6 +179,7 @@ function _create_descriptor(sz::NTuple{N,Int}, T::Type, complex::Bool) where {N}
     # across the ccall: oneMKL copies the dimensions out of `pointer(lengths)`, and
     # without GC.@preserve the array can be collected first, leaving the descriptor
     # with garbage dimensions (commit then fails with FFT_INVALID_DESCRIPTOR).
+    flush_deferred_dft_releases()
     lengths = collect(Int64, sz)
     st = GC.@preserve lengths (length(lengths) == 1 ?
         onemklDftCreate1D(desc_ref, prec, dom, lengths[1]) :
@@ -185,7 +264,7 @@ function _plan_cfft(X::oneAPI.oneArray{T, N}, region, K::Bool, inplace::Bool) wh
     end
 
     stc = onemklDftCommit(desc, q); stc == 0 || error("commit failed ($stc)")
-    return cMKLFFTPlan{T, K, inplace, N, R, Nothing}(desc, q, sz, sz, false, reg, nloop, loopstride, nothing, nothing)
+    return _own(cMKLFFTPlan{T, K, inplace, N, R, Nothing}(desc, q, sz, sz, false, reg, nloop, loopstride, nothing, nothing), X)
 end
 
 plan_fft(X::oneAPI.oneArray{T, N}, region) where {T <: Union{ComplexF32, ComplexF64}, N} =
@@ -263,7 +342,7 @@ function _plan_rfft_1d(X::oneAPI.oneArray{T,N}, reg::NTuple{1,Int}) where {T<:Un
 
     stc = onemklDftCommit(desc, q); stc == 0 || error("commit failed ($stc)")
     R = length(reg)
-    rMKLFFTPlan{T,MKLFFT_FORWARD,false,N,R,typeof(buffer)}(desc,q,xdims,ydims,:rfft,reg,buffer,nothing)
+    _own(rMKLFFTPlan{T,MKLFFT_FORWARD,false,N,R,typeof(buffer)}(desc,q,xdims,ydims,:rfft,reg,buffer,nothing), X)
 end
 
 # Multi-dimensional real FFT using complex FFT approach
@@ -365,7 +444,7 @@ function _plan_brfft_1d(X::oneAPI.oneArray{T,N}, d::Integer, reg::NTuple{1,Int})
 
     stc = onemklDftCommit(desc, q); stc == 0 || error("commit failed ($stc)")
     R = length(reg)
-    rMKLFFTPlan{T,MKLFFT_INVERSE,false,N,R,typeof(buffer)}(desc,q,xdims,ydims,:brfft,reg,buffer,nothing)
+    _own(rMKLFFTPlan{T,MKLFFT_INVERSE,false,N,R,typeof(buffer)}(desc,q,xdims,ydims,:brfft,reg,buffer,nothing), X)
 end
 
 # Multi-dimensional real inverse FFT using complex FFT approach
